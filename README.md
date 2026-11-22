@@ -23,9 +23,10 @@ A modular Python recovery framework for extracting bit-exact ISO images and resc
 
 ```
 .
-├── auto_cd_recover.py             # Top-level CLI entry point
+├── miffy.py                       # Top-level CLI entry point
 ├── README.md                      # Project documentation & usage guide
 ├── AGENTS.md                      # Operational & hardware safety rules
+├── LICENSE                        # GNU General Public License v3.0
 ├── src/
 │   ├── core/                      # Dataclasses (models.py), ECMA-130 math (rspc.py), SQLite/ISO persistence (state.py)
 │   ├── hardware/                  # Linux SG_IO /dev/sgN auto-detection, Mode Page 0x01/0x2A, raw+C2 I/O (device.py)
@@ -33,20 +34,18 @@ A modular Python recovery framework for extracting bit-exact ISO images and resc
 │   ├── solvers/                   # Pluggable Tier 1–3 RSPC/EDC solvers (base.py, portfolio.py, deep_algebraic.py)
 │   ├── formats/                   # Pluggable file format handlers (jpeg_handler.py, bmp_handler.py, image_generic.py, binary_handlers.py)
 │   ├── pipeline/                  # 6-stage orchestrator & per-CD session manager (orchestrator.py)
-│   └── legacy/                    # Original standalone scripts from the miffy CD-ROM recovery investigation
+│   └── legacy/                    # Original standalone scripts from the initial CD-ROM recovery investigation
 ├── test/
 │   ├── core/                      # ECMA-130 & SQLite unit tests
 │   ├── filesystem/                # ISO-9660/Joliet & etiology tests
 │   ├── solvers/                   # Multi-tier solver functional tests
 │   ├── formats/                   # JPEG DCT, BMP, PNG CRC & binary validator tests
 │   └── pipeline/                  # Session folder resolution & CLI integration tests
-└── recovered/
-    └── MIFFY/                     # Recovered MIFFY CD-ROM artifacts (100% of 688 /Photo/L_Photo photos verified)
-        ├── miffy1.iso             # Untouched baseline WinCDEmu image (253,806,592 B)
-        ├── miffy_recovered.iso    # Patched full-volume ISO image (254,113,792 B)
-        ├── bad sector.txt         # WinCDEmu bad-sector report
-        ├── logs/                  # SQLite pass cache (raw_passes.sqlite3), recovery_state.json, run logs
-        └── extracted/             # Extracted media, photo_manifest.csv, L_PHOTO/, S/, PIC/, PHOTO.INI
+└── recovered/                     # Git-ignored per-CD recovery outputs (auto-named by Volume ID or UUID)
+    └── <VOLUME_ID>/               # Example session directory (e.g., MY_DISC/ or cd_<uuid>/)
+        ├── <volume>_recovered.iso # Patched full-volume ISO image
+        ├── logs/                  # SQLite pass cache (raw_passes.sqlite3), recovery_state.json, reports
+        └── extracted/             # Extracted & format-repaired files + manifest
 ```
 
 ---
@@ -59,7 +58,7 @@ A modular Python recovery framework for extracting bit-exact ISO images and resc
 Insert a disc into your optical drive and run:
 
 ```bash
-python3 auto_cd_recover.py --full-rip --categories all --max-passes 24
+python3 miffy.py --full-rip --categories all --max-passes 24
 ```
 
 This automatically:
@@ -72,16 +71,16 @@ This automatically:
 
 ```bash
 # Inspect registered solver and format handler plugins
-python3 auto_cd_recover.py --list-plugins
+python3 miffy.py --list-plugins
 
 # Run strictly in-memory synthetic JPEG & BMP repair verification
-python3 auto_cd_recover.py --test-synthetic-repair
+python3 miffy.py --test-synthetic-repair
 
-# Run offline against the cached MIFFY session (explicit session name or ISO path)
-python3 auto_cd_recover.py \
+# Run offline against an existing cached session (explicit session name or ISO path)
+python3 miffy.py \
   --no-hardware \
-  --name MIFFY \
-  --iso-out recovered/MIFFY/miffy_recovered.iso \
+  --name MY_DISC \
+  --iso-out recovered/MY_DISC/my_disc_recovered.iso \
   --categories photo_l,photo_s,pic,photo
 ```
 
@@ -134,3 +133,9 @@ class TiffRepairHandler(FileFormatHandler):
         ...
 ```
 Import it in `src/formats/__init__.py` to enable auto-registration.
+
+---
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 — see the [LICENSE](LICENSE) file for details.

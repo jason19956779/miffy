@@ -47,7 +47,7 @@ class TestAutoPipeline(unittest.TestCase):
 
     def test_cli_list_plugins(self):
         out = subprocess.check_output(
-            [sys.executable, str(REPO_DIR / "auto_cd_recover.py"), "--list-plugins"],
+            [sys.executable, str(REPO_DIR / "miffy.py"), "--list-plugins"],
             cwd=str(REPO_DIR),
             text=True,
         )

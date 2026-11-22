@@ -1,7 +1,8 @@
 *
 !AGENTS.md
+!LICENSE
 !README.md
-!auto_cd_recover.py
+!miffy.py
 !src/
 !src/**
 !test/
