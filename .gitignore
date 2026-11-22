@@ -1,0 +1,15 @@
+*
+!AGENTS.md
+!README.md
+!auto_cd_recover.py
+!src/
+!src/**
+!test/
+!test/**
+!recovered/
+!recovered/.gitignore
+!.gitignore
+__pycache__/
+**/__pycache__/
+**/__pycache__/**
+*.py[cod]
