@@ -11,6 +11,48 @@ from src.formats.base import FileFormatHandler
 from src.core.models import FileExtent
 
 
+def validate_bmp_structure(data: bytes) -> tuple[bool, list[str], dict]:
+    """Strictly verify BITMAPFILEHEADER, BITMAPINFOHEADER, and pixel buffer bounds."""
+    issues: list[str] = []
+    if len(data) < 54 or data[0:2] != b"BM":
+        return False, ["bad_magic_or_short_header"], {"bmp_struct_valid": False}
+
+    bf_size, r1, r2, bf_off = struct.unpack_from("<IHHI", data, 2)
+    bi_size, w, h, planes, bpp, comp, img_sz = struct.unpack_from("<IiiHHII", data, 14)
+
+    if r1 != 0 or r2 != 0:
+        issues.append(f"nonzero_reserved:{r1},{r2}")
+    if bf_size != len(data):
+        issues.append(f"bfSize_mismatch:{bf_size}!={len(data)}")
+    if bi_size not in (40, 52, 56, 108, 124):
+        issues.append(f"unsupported_biSize:{bi_size}")
+    if bf_off < 14 + bi_size:
+        issues.append(f"bad_bfOffBits:{bf_off}<{14 + bi_size}")
+    if w <= 0 or h == 0:
+        issues.append(f"bad_dims:{w}x{h}")
+    if planes != 1:
+        issues.append(f"bad_planes:{planes}")
+    if bpp not in (1, 4, 8, 16, 24, 32):
+        issues.append(f"bad_bpp:{bpp}")
+
+    if comp == 0 and w > 0 and h != 0 and bpp in (1, 4, 8, 16, 24, 32):
+        stride = ((w * bpp + 31) // 32) * 4
+        expected_img = stride * abs(h)
+        if len(data) < bf_off + expected_img:
+            issues.append(f"truncated_pixels:{len(data)}<{bf_off + expected_img}")
+        if img_sz not in (0, expected_img):
+            issues.append(f"biSizeImage_mismatch:{img_sz}!={expected_img}")
+
+    meta = {
+        "bmp_struct_valid": len(issues) == 0,
+        "width": w,
+        "height": h,
+        "bpp": bpp,
+        "compression": comp,
+    }
+    return len(issues) == 0, issues, meta
+
+
 @FormatRegistry.register
 class BmpFormatHandler(FileFormatHandler):
     name = "bmp"
@@ -39,14 +81,17 @@ class BmpFormatHandler(FileFormatHandler):
         return None, None
 
     def validate(self, data: bytes) -> tuple[bool, str, dict]:
+        bmp_ok, bmp_issues, bmp_meta = validate_bmp_structure(data)
+        if not bmp_ok:
+            return False, f"BMP_STRUCT_ERR ({'; '.join(bmp_issues[:3])})", bmp_meta
         try:
             with Image.open(io.BytesIO(data)) as im:
                 im.verify()
             with Image.open(io.BytesIO(data)) as im2:
                 im2.load()
-                return True, "STRICT_OK", {"dims": f"{im2.size[0]}x{im2.size[1]} {im2.mode}"}
+                return True, "STRICT_OK", {"dims": f"{im2.size[0]}x{im2.size[1]} {im2.mode}", **bmp_meta}
         except Exception as exc:
-            return False, f"DECODE_ERR ({type(exc).__name__}: {exc})", {}
+            return False, f"DECODE_ERR ({type(exc).__name__}: {exc})", bmp_meta
 
     def reconstruct(
         self,

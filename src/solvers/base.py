@@ -15,6 +15,7 @@ class SectorSolverPlugin(ABC):
 
     name: str = "base"
     tier: int = 1
+    priority: int = 50
     description: str = ""
 
     @abstractmethod

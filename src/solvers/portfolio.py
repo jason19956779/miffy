@@ -19,14 +19,14 @@ def _orth_cw(is_p: bool, pos: int) -> tuple[int, ...] | None:
 def clean_single_pass(
     lba: int, raw_sec: bytes, c2_bytes: bytes
 ) -> tuple[bool, bytearray, set[int]]:
-    """Single-pass C2-erasure RSPC decoding + orthogonal 1-error polish."""
+    """Single-pass C2-erasure RSPC decoding + orthogonal 1-error polish (FIXED_POS locked)."""
     sec = bytearray(raw_sec)
     rspc.init_sector_header(lba, sec)
     c2_eras = rspc.c2_set(c2_bytes)
     eras = set(c2_eras)
 
     for _ in range(15):
-        if rspc.check_and_fix_q_parity(sec):
+        if rspc.check_and_fix_q_parity(sec, expected_lba=lba):
             return True, sec, c2_eras
         changed = 0
         for cw_list in (rspc.P_IDX, rspc.Q_IDX):
@@ -35,10 +35,10 @@ def clean_single_pass(
                     for pos in cw:
                         eras.discard(pos)
                     continue
-                cw_eras = [i for i, pos in enumerate(cw) if pos in eras]
+                cw_eras = [i for i, pos in enumerate(cw) if pos in eras and pos not in rspc.FIXED_POS]
                 if 1 <= len(cw_eras) <= 2:
                     ok, corrs = rspc.solve_2eras(sec, cw, cw_eras)
-                    if ok:
+                    if ok and all(pos not in rspc.FIXED_POS for pos, _ in corrs):
                         for pos, val in corrs:
                             sec[pos] = val
                         for i in cw_eras:
@@ -46,7 +46,7 @@ def clean_single_pass(
                         changed += 1
                         continue
                 st1, corr1 = rspc.solve_1err(sec, cw)
-                if st1 == 1 and corr1[0][0] in eras:
+                if st1 == 1 and corr1[0][0] in eras and corr1[0][0] not in rspc.FIXED_POS:
                     pos, val = corr1[0]
                     sec[pos] = val
                     eras.discard(pos)
@@ -68,10 +68,12 @@ def clean_single_pass(
                                 sec[pos] = old
         if changed == 0:
             break
-    return rspc.check_and_fix_q_parity(sec), sec, c2_eras
+    return rspc.check_and_fix_q_parity(sec, expected_lba=lba), sec, c2_eras
 
 
-def _try_plane_sweep(comp: bytearray, candidate_vals: list[set[int]]) -> bytearray | None:
+def _try_plane_sweep(
+    comp: bytearray, candidate_vals: list[set[int]], expected_lba: int | None = None
+) -> bytearray | None:
     test = bytearray(comp)
     for plane in (0, 1):
         p_bad = [i for i in range(plane, 86, 2) if rspc.syndromes_p(test, rspc.P_IDX[i]) != (0, 0)]
@@ -81,9 +83,13 @@ def _try_plane_sweep(comp: bytearray, candidate_vals: list[set[int]]) -> bytearr
             mod_q = set()
             for q_idx in q_bad:
                 cw = rspc.Q_IDX[q_idx]
-                eras = [i for i, pos in enumerate(cw[:43]) if rspc.BYTE_TO_P[pos] in p_set]
+                eras = [
+                    i
+                    for i, pos in enumerate(cw[:43])
+                    if pos not in rspc.FIXED_POS and rspc.BYTE_TO_P[pos] in p_set
+                ]
                 ok, corrs = rspc.solve_2eras(test, cw, eras)
-                if ok and corrs:
+                if ok and corrs and all(pos not in rspc.FIXED_POS for pos, _ in corrs):
                     for pos, val in corrs:
                         test[pos] = val
                     mod_q.add(q_idx)
@@ -92,14 +98,22 @@ def _try_plane_sweep(comp: bytearray, candidate_vals: list[set[int]]) -> bytearr
                 if rspc.syndromes_p(test, cw) == (0, 0):
                     continue
                 st1, c1 = rspc.solve_1err(test, cw)
-                if st1 == 1:
+                if st1 == 1 and c1[0][0] not in rspc.FIXED_POS:
                     test[c1[0][0]] = c1[0][1]
                 else:
-                    cand_i = [i for i, pos in enumerate(cw) if rspc.BYTE_TO_Q.get(pos) in mod_q]
+                    cand_i = [
+                        i
+                        for i, pos in enumerate(cw)
+                        if pos not in rspc.FIXED_POS and rspc.BYTE_TO_Q.get(pos) in mod_q
+                    ]
                     if 2 <= len(cand_i) <= 12:
                         for i0, i1 in combinations(cand_i, 2):
                             ok, corrs = rspc.solve_2eras(test, cw, [i0, i1])
-                            if ok and len(corrs) == 2 and all(v in candidate_vals[p] for p, v in corrs):
+                            if (
+                                ok
+                                and len(corrs) == 2
+                                and all(p not in rspc.FIXED_POS and v in candidate_vals[p] for p, v in corrs)
+                            ):
                                 for p, v in corrs:
                                     test[p] = v
                                 break
@@ -107,12 +121,16 @@ def _try_plane_sweep(comp: bytearray, candidate_vals: list[set[int]]) -> bytearr
             q_set = set(q_bad)
             for p_idx in p_bad:
                 cw = rspc.P_IDX[p_idx]
-                eras = [i for i, pos in enumerate(cw) if pos in rspc.BYTE_TO_Q and rspc.BYTE_TO_Q[pos] in q_set]
+                eras = [
+                    i
+                    for i, pos in enumerate(cw)
+                    if pos not in rspc.FIXED_POS and pos in rspc.BYTE_TO_Q and rspc.BYTE_TO_Q[pos] in q_set
+                ]
                 ok, corrs = rspc.solve_2eras(test, cw, eras)
-                if ok and corrs:
+                if ok and corrs and all(pos not in rspc.FIXED_POS for pos, _ in corrs):
                     for pos, val in corrs:
                         test[pos] = val
-    return test if rspc.check_and_fix_q_parity(test) else None
+    return test if rspc.check_and_fix_q_parity(test, expected_lba=expected_lba) else None
 
 
 def subgrid_peel_decode(
@@ -120,48 +138,42 @@ def subgrid_peel_decode(
     raw_passes: list[tuple[bytes, bytes]],
     include_q_parity_in_uncov: bool = True,
     c2_strict: bool = False,
+    pass_cache: list[dict] | None = None,
+    indices: list[int] | None = None,
 ) -> tuple[bool, int, int, bytearray]:
-    """Codeword-weighted vote + K43,26 subgrid peeling + weight-3 unmasking."""
-    passes: list[bytearray] = []
-    c2_sets: list[set[int]] = []
+    """Codeword-weighted vote + K43,26 subgrid peeling + weight-3 unmasking (FIXED_POS locked)."""
+    if pass_cache is None:
+        pass_cache = rspc.build_pass_cache(lba, raw_passes)
+    sel = [pass_cache[i] for i in indices] if indices is not None else pass_cache
+    if not sel:
+        comp = bytearray(2352)
+        rspc.init_sector_header(lba, comp)
+        return False, 0, 0, comp
+
     c2_union: set[int] = set()
     candidate_vals: list[set[int]] = [set() for _ in range(2352)]
+    votes = [Counter() for _ in range(2352)]
 
-    for raw_sec, c2_bytes in raw_passes:
-        sec = bytearray(raw_sec)
-        rspc.init_sector_header(lba, sec)
-        c2 = rspc.c2_set(c2_bytes)
-        passes.append(sec)
-        c2_sets.append(c2)
+    for entry in sel:
+        sec = entry["sec"]
+        c2 = entry["c2"]
         c2_union.update(c2)
-        for j in range(2352):
+        for j in range(16, 2352):
             candidate_vals[j].add(sec[j])
 
-    votes = [Counter() for _ in range(2352)]
-    for p_idx, sec in enumerate(passes):
-        c2 = c2_sets[p_idx]
-        p_ok = [
-            rspc.syndromes_p(sec, cw) == (0, 0)
-            and (not c2_strict or sum(1 for pos in cw if pos in c2) < 2)
-            for cw in rspc.P_IDX
-        ]
-        q_ok = [
-            rspc.syndromes_q(sec, cw) == (0, 0)
-            and (not c2_strict or sum(1 for pos in cw if pos in c2) < 2)
-            for cw in rspc.Q_IDX
-        ]
-        p_1err = {}
-        for idx, cw in enumerate(rspc.P_IDX):
-            if not p_ok[idx]:
-                st1, c1 = rspc.solve_1err(sec, cw)
-                if st1 == 1:
-                    p_1err[c1[0][0]] = c1[0][1]
-        for idx, cw in enumerate(rspc.Q_IDX):
-            if not q_ok[idx]:
-                st1, c1 = rspc.solve_1err(sec, cw)
-                if st1 == 1 and p_1err.get(c1[0][0]) == c1[0][1]:
-                    votes[c1[0][0]][c1[0][1]] += 80
-                    candidate_vals[c1[0][0]].add(c1[0][1])
+        if c2_strict:
+            p_ok = [entry["p_ok_raw"][i] and entry["p_c2_hits"][i] < 2 for i in range(86)]
+            q_ok = [entry["q_ok_raw"][i] and entry["q_c2_hits"][i] < 2 for i in range(52)]
+        else:
+            p_ok = entry["p_ok_raw"]
+            q_ok = entry["q_ok_raw"]
+
+        for pos, val in entry["agreed_1err"].items():
+            p_idx = rspc.BYTE_TO_P.get(pos)
+            q_idx = rspc.BYTE_TO_Q.get(pos)
+            if p_idx is not None and q_idx is not None and not p_ok[p_idx] and not q_ok[q_idx]:
+                votes[pos][val] += 80
+                candidate_vals[pos].add(val)
 
         for j in range(16, 2352):
             if j in rspc.FIXED_POS:
@@ -183,9 +195,9 @@ def subgrid_peel_decode(
 
     used_unmask: set[tuple[int, int]] = set()
     for _ in range(45):
-        if rspc.check_and_fix_q_parity(comp):
+        if rspc.check_and_fix_q_parity(comp, expected_lba=lba):
             return True, 86, 52, comp
-        swept = _try_plane_sweep(comp, candidate_vals)
+        swept = _try_plane_sweep(comp, candidate_vals, expected_lba=lba)
         if swept is not None:
             return True, 86, 52, swept
 
@@ -195,7 +207,7 @@ def subgrid_peel_decode(
         q_par_fixed = 0
         for idx in list(q_bad):
             st1, c1 = rspc.solve_1err(comp, rspc.Q_IDX[idx])
-            if st1 == 1 and c1[0][0] >= 2248:
+            if st1 == 1 and c1[0][0] >= 2248 and c1[0][0] not in rspc.FIXED_POS:
                 comp[c1[0][0]] = c1[0][1]
                 q_bad.discard(idx)
                 q_par_fixed += 1
@@ -225,10 +237,10 @@ def subgrid_peel_decode(
                 cw = cw_list[idx]
                 if rspc.syndromes(comp, cw) == (0, 0):
                     continue
-                eras = [i for i, pos in enumerate(cw) if pos in uncov]
+                eras = [i for i, pos in enumerate(cw) if pos in uncov and pos not in rspc.FIXED_POS]
                 if len(eras) == 1 or (include_q_parity_in_uncov and len(eras) == 2):
                     ok, corrs = rspc.solve_2eras(comp, cw, eras)
-                    if ok and corrs:
+                    if ok and corrs and all(pos not in rspc.FIXED_POS for pos, _ in corrs):
                         for pos, val in corrs:
                             comp[pos] = val
                             uncov.discard(pos)
@@ -240,7 +252,7 @@ def subgrid_peel_decode(
             for idx in list(bad_set):
                 cw = cw_list[idx]
                 st1, c1 = rspc.solve_1err(comp, cw)
-                if st1 == 1 and c1[0][0] in uncov:
+                if st1 == 1 and c1[0][0] in uncov and c1[0][0] not in rspc.FIXED_POS:
                     pos, val = c1[0]
                     old = comp[pos]
                     comp[pos] = val
@@ -263,11 +275,11 @@ def subgrid_peel_decode(
                 cw = cw_list[idx]
                 if rspc.syndromes(comp, cw) == (0, 0):
                     continue
-                ec = [i for i, pos in enumerate(cw) if pos in uncov]
+                ec = [i for i, pos in enumerate(cw) if pos in uncov and pos not in rspc.FIXED_POS]
                 if 2 <= len(ec) <= 10:
                     for i0, i1 in combinations(ec, 2):
                         ok, corrs = rspc.solve_2eras(comp, cw, [i0, i1])
-                        if not ok or len(corrs) != 2:
+                        if not ok or len(corrs) != 2 or any(p in rspc.FIXED_POS for p, _ in corrs):
                             continue
                         (pos0, val0), (pos1, val1) = corrs
                         old0, old1 = comp[pos0], comp[pos1]
@@ -316,10 +328,23 @@ def subgrid_peel_decode(
         if changed == 0:
             break
 
-    if rspc.check_and_fix_q_parity(comp):
+    if rspc.check_and_fix_q_parity(comp, expected_lba=lba):
         return True, 86, 52, comp
     pz, qz = rspc.count_pq(comp)
     return False, pz, qz, comp
+
+
+def _get_sorted_pass_cache(
+    lba: int, raw_passes: list[tuple[bytes, bytes]], context: dict | None
+) -> tuple[list[dict], list[int]]:
+    if context is not None and "pass_cache" in context:
+        pass_cache = context["pass_cache"]
+    else:
+        pass_cache = rspc.build_pass_cache(lba, raw_passes)
+        if context is not None:
+            context["pass_cache"] = pass_cache
+    order = sorted(range(len(pass_cache)), key=lambda i: pass_cache[i]["p_ok_count"], reverse=True)
+    return pass_cache, order
 
 
 @SolverRegistry.register
@@ -331,6 +356,8 @@ class SinglePassC2Solver(SectorSolverPlugin):
     def solve(self, lba, raw_passes, context=None):
         best = (False, -1, -1, bytearray(2352), "PARTIAL_A")
         for raw_sec, c2_b in reversed(raw_passes):
+            if rspc.is_frame_slip(lba, raw_sec):
+                continue
             ok, sec, _ = clean_single_pass(lba, raw_sec, c2_b)
             if ok:
                 return True, 86, 52, sec, "A_SINGLE_C2"
@@ -344,28 +371,80 @@ class SinglePassC2Solver(SectorSolverPlugin):
 class SubgridPeelSolver(SectorSolverPlugin):
     name = "subgrid_peel"
     tier = 1
-    description = "Top-K pass codeword-weighted voting + K43,26 subgrid peeling + weight-3 unmasking."
+    description = "Fast top-K pass codeword-weighted voting + K43,26 subgrid peeling using shared pass cache."
 
     def solve(self, lba, raw_passes, context=None):
-        scored = sorted(
-            raw_passes,
-            key=lambda x: sum(1 for cw in rspc.P_IDX if rspc.syndromes_p(x[0], cw) == (0, 0)),
+        filtered = [(r, c) for r, c in raw_passes if not rspc.is_frame_slip(lba, r)]
+        if not filtered:
+            sec = bytearray(2352)
+            rspc.init_sector_header(lba, sec)
+            return False, 0, 0, sec, "PARTIAL_B_SLIP"
+        pass_cache, order = _get_sorted_pass_cache(lba, filtered, context)
+        n = len(order)
+        fast_ks = sorted(
+            {k for k in (n, n - 1, max(2, n // 2), 6, 4, 2) if 1 <= k <= n},
             reverse=True,
         )
-        n = len(scored)
-        ks = sorted(
+
+        best = (False, -1, -1, bytearray(2352), "PARTIAL_B")
+        for k in fast_ks:
+            ok, pz, qz, v = subgrid_peel_decode(
+                lba, filtered, include_q_parity_in_uncov=False, c2_strict=False, pass_cache=pass_cache, indices=order[:k]
+            )
+            if ok:
+                return True, 86, 52, v, f"B_SUBGRID_K{k}_Q0_S0"
+            if rspc.partial_score(pz, qz) > rspc.partial_score(best[1], best[2]):
+                best = (False, pz, qz, v, f"PARTIAL_B_K{k}_Q0_S0")
+
+        for k in fast_ks[:3]:
+            ok, pz, qz, v = subgrid_peel_decode(
+                lba, filtered, include_q_parity_in_uncov=True, c2_strict=False, pass_cache=pass_cache, indices=order[:k]
+            )
+            if ok:
+                return True, 86, 52, v, f"B_SUBGRID_K{k}_Q1_S0"
+            if rspc.partial_score(pz, qz) > rspc.partial_score(best[1], best[2]):
+                best = (False, pz, qz, v, f"PARTIAL_B_K{k}_Q1_S0")
+        return best
+
+
+@SolverRegistry.register
+class SubgridPeelExhaustiveSolver(SectorSolverPlugin):
+    name = "subgrid_peel_exhaustive"
+    tier = 3
+    description = "Exhaustive k-subset and strict-C2 K43,26 subgrid peel sweep over stubborn sectors."
+
+    def solve(self, lba, raw_passes, context=None):
+        filtered = [(r, c) for r, c in raw_passes if not rspc.is_frame_slip(lba, r)]
+        if len(filtered) < 2:
+            sec = bytearray(2352)
+            rspc.init_sector_header(lba, sec)
+            return False, 0, 0, sec, "PARTIAL_B_EX"
+        pass_cache, order = _get_sorted_pass_cache(lba, filtered, context)
+        n = len(order)
+        all_ks = sorted(
             {k for k in (n, n - 1, round(0.8 * n), round(0.6 * n), n // 2, 6, 4, 3, 2) if 1 <= k <= n},
             reverse=True,
         )
         if n >= 8:
-            ks.extend(k for k in range(n - 2, 1, -1) if k not in ks)
+            all_ks.extend(k for k in range(n - 2, 1, -1) if k not in all_ks)
+        fast_ks_s0 = sorted({k for k in (n, n - 1, max(2, n // 2), 6, 4, 2) if 1 <= k <= n}, reverse=True)
+        already_q0_s0 = set(fast_ks_s0)
+        already_q1_s0 = set(fast_ks_s0[:3])
 
-        best = (False, -1, -1, bytearray(2352), "PARTIAL_B")
+        best = (False, -1, -1, bytearray(2352), "PARTIAL_B_EX")
         for c2_strict in (False, True):
-            for k in ks:
-                sub = scored[:k]
+            for k in all_ks:
                 for inc_q in (False, True):
-                    ok, pz, qz, v = subgrid_peel_decode(lba, sub, inc_q, c2_strict)
+                    if not c2_strict and ((not inc_q and k in already_q0_s0) or (inc_q and k in already_q1_s0)):
+                        continue
+                    ok, pz, qz, v = subgrid_peel_decode(
+                        lba,
+                        filtered,
+                        include_q_parity_in_uncov=inc_q,
+                        c2_strict=c2_strict,
+                        pass_cache=pass_cache,
+                        indices=order[:k],
+                    )
                     if ok:
                         return True, 86, 52, v, f"B_SUBGRID_K{k}_Q{int(inc_q)}_S{int(c2_strict)}"
                     if rspc.partial_score(pz, qz) > rspc.partial_score(best[1], best[2]):
@@ -423,7 +502,7 @@ class CleanedConsensusSolver(SectorSolverPlugin):
                     unc.add(j)
 
             for _ in range(25):
-                if rspc.check_and_fix_q_parity(voted):
+                if rspc.check_and_fix_q_parity(voted, expected_lba=lba):
                     return True, 86, 52, voted, f"CLEANED_CONSENSUS_K{k}"
                 ch = 0
                 for cw_list in (rspc.P_IDX, rspc.Q_IDX):
@@ -433,15 +512,17 @@ class CleanedConsensusSolver(SectorSolverPlugin):
                                 unc.discard(pos)
                             continue
                         st1, c1 = rspc.solve_1err(voted, cw)
-                        if st1 == 1 and c1[0][0] in unc:
+                        if st1 == 1 and c1[0][0] in unc and c1[0][0] not in rspc.FIXED_POS:
                             voted[c1[0][0]] = c1[0][1]
                             unc.discard(c1[0][0])
                             ch += 1
                             continue
-                        eras = [i for i, pos in enumerate(cw) if pos in unc]
+                        eras = [i for i, pos in enumerate(cw) if pos in unc and pos not in rspc.FIXED_POS]
                         if len(eras) == 1 or len(eras) == 2:
                             ok, corrs = rspc.solve_2eras(voted, cw, eras)
-                            if ok and (len(eras) == 1 or all(v in cand_vals[p] for p, v in corrs)):
+                            if ok and all(p not in rspc.FIXED_POS for p, _ in corrs) and (
+                                len(eras) == 1 or all(v in cand_vals[p] for p, v in corrs)
+                            ):
                                 for p, v in corrs:
                                     voted[p] = v
                                 for i in eras:
@@ -449,7 +530,7 @@ class CleanedConsensusSolver(SectorSolverPlugin):
                                 ch += 1
                 if ch == 0:
                     break
-            if rspc.check_and_fix_q_parity(voted):
+            if rspc.check_and_fix_q_parity(voted, expected_lba=lba):
                 return True, 86, 52, voted, f"CLEANED_CONSENSUS_K{k}"
             pz, qz = rspc.count_pq(voted)
             if rspc.partial_score(pz, qz) > rspc.partial_score(best[1], best[2]):
@@ -505,17 +586,17 @@ class AnchorC2GraftSolver(SectorSolverPlugin):
                     unc.add(pos)
 
             for _ in range(25):
-                if rspc.check_and_fix_q_parity(sec):
+                if rspc.check_and_fix_q_parity(sec, expected_lba=lba):
                     return True, 86, 52, sec, "D_ANCHOR_GRAFT"
                 ch = 0
                 for cw_list in (rspc.P_IDX, rspc.Q_IDX):
                     for cw in cw_list:
                         if rspc.syndromes(sec, cw) == (0, 0):
                             continue
-                        eras = [i for i, pos in enumerate(cw) if pos in unc]
+                        eras = [i for i, pos in enumerate(cw) if pos in unc and pos not in rspc.FIXED_POS]
                         if 1 <= len(eras) <= 2:
                             ok, corrs = rspc.solve_2eras(sec, cw, eras)
-                            if ok:
+                            if ok and all(pos not in rspc.FIXED_POS for pos, _ in corrs):
                                 for pos, val in corrs:
                                     sec[pos] = val
                                 for i in eras:
@@ -538,7 +619,7 @@ class AnchorC2GraftSolver(SectorSolverPlugin):
                                 sec[pos] = old
                 if ch == 0:
                     break
-            if rspc.check_and_fix_q_parity(sec):
+            if rspc.check_and_fix_q_parity(sec, expected_lba=lba):
                 return True, 86, 52, sec, "D_ANCHOR_GRAFT"
             pz, qz = rspc.count_pq(sec)
             if rspc.partial_score(pz, qz) > rspc.partial_score(best[1], best[2]):

@@ -62,6 +62,75 @@ class RecoveryStateDB:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pass_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lba INTEGER NOT NULL,
+                pass_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                round_idx INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                speed_kbps INTEGER NOT NULL,
+                p_ok INTEGER NOT NULL,
+                q_ok INTEGER NOT NULL,
+                msf_hex TEXT NOT NULL,
+                msf_valid INTEGER NOT NULL,
+                frame_slip INTEGER NOT NULL,
+                solve_ms REAL NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS round_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                round_idx INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                speed_kbps INTEGER NOT NULL,
+                lead INTEGER NOT NULL,
+                remaining_before INTEGER NOT NULL,
+                batch_count INTEGER NOT NULL,
+                newly_verified INTEGER NOT NULL,
+                frame_slips INTEGER NOT NULL,
+                read_elapsed_s REAL NOT NULL,
+                solve_elapsed_s REAL NOT NULL,
+                total_elapsed_s REAL NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS solver_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                lba INTEGER NOT NULL,
+                max_tier INTEGER NOT NULL,
+                solver_name TEXT NOT NULL,
+                pass_count INTEGER NOT NULL,
+                ok INTEGER NOT NULL,
+                p_ok INTEGER NOT NULL,
+                q_ok INTEGER NOT NULL,
+                strategy TEXT NOT NULL,
+                elapsed_ms REAL NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS debug_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                event TEXT NOT NULL,
+                lba INTEGER,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
         self.conn.commit()
 
     def close(self) -> None:
@@ -121,6 +190,96 @@ class RecoveryStateDB:
             (lba, pass_id, raw_2352, c2_294, pz, qz),
         )
         return pz, qz
+
+    def record_pass_metric(
+        self,
+        lba: int,
+        pass_id: int,
+        ts: str,
+        phase: str,
+        round_idx: int,
+        direction: str,
+        speed_kbps: int,
+        p_ok: int,
+        q_ok: int,
+        msf_hex: str,
+        msf_valid: int,
+        frame_slip: int,
+        solve_ms: float,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO pass_metrics "
+            "(lba, pass_id, ts, phase, round_idx, direction, speed_kbps, p_ok, q_ok, "
+            "msf_hex, msf_valid, frame_slip, solve_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (lba, pass_id, ts, phase, round_idx, direction, speed_kbps, p_ok, q_ok, msf_hex, msf_valid, frame_slip, solve_ms),
+        )
+
+    def record_round_log(
+        self,
+        ts: str,
+        phase: str,
+        round_idx: int,
+        direction: str,
+        speed_kbps: int,
+        lead: int,
+        remaining_before: int,
+        batch_count: int,
+        newly_verified: int,
+        frame_slips: int,
+        read_elapsed_s: float,
+        solve_elapsed_s: float,
+        total_elapsed_s: float,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO round_logs "
+            "(ts, phase, round_idx, direction, speed_kbps, lead, remaining_before, batch_count, "
+            "newly_verified, frame_slips, read_elapsed_s, solve_elapsed_s, total_elapsed_s) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ts,
+                phase,
+                round_idx,
+                direction,
+                speed_kbps,
+                lead,
+                remaining_before,
+                batch_count,
+                newly_verified,
+                frame_slips,
+                read_elapsed_s,
+                solve_elapsed_s,
+                total_elapsed_s,
+            ),
+        )
+
+    def record_solver_attempt(
+        self,
+        ts: str,
+        lba: int,
+        max_tier: int,
+        solver_name: str,
+        pass_count: int,
+        ok: int,
+        p_ok: int,
+        q_ok: int,
+        strategy: str,
+        elapsed_ms: float,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO solver_attempts "
+            "(ts, lba, max_tier, solver_name, pass_count, ok, p_ok, q_ok, strategy, elapsed_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, lba, max_tier, solver_name, pass_count, ok, p_ok, q_ok, strategy, elapsed_ms),
+        )
+
+    def record_debug_event(
+        self, ts: str, stage: str, event: str, lba: int | None, payload: dict
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO debug_events (ts, stage, event, lba, payload_json) VALUES (?, ?, ?, ?, ?)",
+            (ts, stage, event, lba, json.dumps(payload, default=str)),
+        )
 
     def upsert_solution(
         self,

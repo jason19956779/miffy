@@ -1,5 +1,7 @@
 """Registry and tiered pipeline orchestrator for CD sector solver plugins."""
 
+import time
+
 from src.core import rspc
 from src.solvers.base import SectorSolverPlugin
 
@@ -16,7 +18,10 @@ class SolverRegistry:
 
     @classmethod
     def list_plugins(cls) -> list[SectorSolverPlugin]:
-        return sorted((c() for c in cls._plugins.values()), key=lambda s: (s.tier, s.name))
+        return sorted(
+            (c() for c in cls._plugins.values()),
+            key=lambda s: (s.tier, getattr(s, "priority", 50), s.name),
+        )
 
     @classmethod
     def get_solvers(
@@ -47,11 +52,61 @@ class SolverPipeline:
             rspc.init_sector_header(lba, sec)
             return False, 0, 0, sec, "NO_PASSES"
 
+        filtered_passes = []
+        slips_filtered = 0
+        for raw_sec, c2_b in raw_passes:
+            if rspc.is_frame_slip(lba, raw_sec):
+                slips_filtered += 1
+            else:
+                filtered_passes.append((raw_sec, c2_b))
+
+        ctx = context if context is not None else {}
+        ctx["frame_slips_filtered"] = slips_filtered
+
+        if not filtered_passes:
+            sec = bytearray(2352)
+            rspc.init_sector_header(lba, sec)
+            return False, 0, 0, sec, "ALL_FRAME_SLIPS"
+
+        if len(filtered_passes) >= 2 and "pass_cache" not in ctx:
+            ctx["pass_cache"] = rspc.build_pass_cache(lba, filtered_passes)
+
+        trace = ctx.get("debug_trace")
         best = (False, -1, -1, bytearray(2352), "NONE")
         for solver in self.solvers:
             if max_tier is not None and solver.tier > max_tier:
                 continue
-            ok, pz, qz, sec, strat = solver.solve(lba, raw_passes, context=context)
+            t0 = time.perf_counter()
+            ok, pz, qz, sec, strat = solver.solve(lba, filtered_passes, context=ctx)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if ok and not rspc.check_and_fix_q_parity(sec, expected_lba=lba):
+                ok = False
+                pz, qz = rspc.count_pq(sec)
+                strat = f"REJECTED_{strat}"
+            if ok:
+                c2_list = (
+                    [e["c2"] for e in ctx["pass_cache"]]
+                    if "pass_cache" in ctx and len(ctx["pass_cache"]) == len(filtered_passes)
+                    else None
+                )
+                q_phys_ok, q_cm, q_cc = rspc.verify_physical_q_parity(sec, filtered_passes, c2_sets=c2_list)
+                ctx["physical_q_match"] = (q_cm, q_cc)
+                if not q_phys_ok:
+                    ok = False
+                    pz, qz = rspc.count_pq(sec)
+                    strat = f"REJECTED_QPAR_{strat}"
+            if isinstance(trace, list):
+                trace.append(
+                    {
+                        "solver": solver.name,
+                        "tier": solver.tier,
+                        "ok": bool(ok),
+                        "p_ok": pz,
+                        "q_ok": qz,
+                        "strategy": strat,
+                        "elapsed_ms": round(elapsed_ms, 2),
+                    }
+                )
             if ok:
                 return True, 86, 52, sec, strat
             if rspc.partial_score(pz, qz) > rspc.partial_score(best[1], best[2]):

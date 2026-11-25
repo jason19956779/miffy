@@ -103,6 +103,23 @@ def lba_header(lba: int) -> bytes:
     )
 
 
+def msf_bytes_to_lba(hdr4: bytes | bytearray) -> int | None:
+    """Decode a 4-byte Mode 1 MSF+Mode header back into an LBA, or None if invalid BCD/Mode."""
+    if len(hdr4) < 4 or hdr4[3] != 0x01:
+        return None
+    vals = []
+    for b in hdr4[:3]:
+        hi, lo = (b >> 4) & 0x0F, b & 0x0F
+        if hi > 9 or lo > 9:
+            return None
+        vals.append(hi * 10 + lo)
+    mm, ss, ff = vals
+    if ss >= 60 or ff >= 75:
+        return None
+    frames = (mm * 60 + ss) * 75 + ff
+    return frames - 150 if frames >= 150 else None
+
+
 def init_sector_header(lba: int, sec: bytearray) -> None:
     """Overwrite known constant Mode 1 Sync, MSF header, and 8 intermediate zero bytes."""
     sec[0:12] = SYNC_12
@@ -202,8 +219,15 @@ def partial_score(pz: int, qz: int) -> tuple[int, int]:
     return (0 if pz == 86 else pz, qz)
 
 
-def check_and_fix_q_parity(sec: bytearray) -> bool:
-    """Verification oracle: 86/86 P-codewords == 0 AND 32-bit EDC match (+ Q-parity fix)."""
+def check_and_fix_q_parity(sec: bytearray, expected_lba: int | None = None) -> bool:
+    """Verification oracle: Mode 1 header (if expected_lba), 86/86 P == 0, AND 32-bit EDC match (+ Q-parity fix)."""
+    if expected_lba is not None:
+        if (
+            sec[0:12] != SYNC_12
+            or sec[12:16] != lba_header(expected_lba)
+            or sec[2068:2076] != b"\x00" * 8
+        ):
+            return False
     if not all(syndromes_p(sec, cw) == (0, 0) for cw in P_IDX):
         return False
     if edc_residual(sec[:2068]) != 0:
@@ -215,6 +239,84 @@ def check_and_fix_q_parity(sec: bytearray) -> bool:
                 for pos, val in corrs:
                     sec[pos] = val
     return all(syndromes_q(sec, cw) == (0, 0) for cw in Q_IDX)
+
+
+def verify_physical_q_parity(
+    sec: bytes | bytearray,
+    raw_passes: list[tuple[bytes, bytes]],
+    c2_sets: list[set[int]] | None = None,
+) -> tuple[bool, int, int]:
+    """Cross-check recomputed 104-byte Q-parity against unflagged C2-clean physical disc reads."""
+    if not raw_passes or len(sec) < 2352:
+        return True, 0, 0
+    c2_list = c2_sets if c2_sets is not None else [c2_set(c2_b) for _, c2_b in raw_passes]
+    q_clean_checked = 0
+    q_clean_match = 0
+    for pos in range(2248, 2352):
+        if any(pos not in c2 for c2 in c2_list):
+            q_clean_checked += 1
+            if any(rp[0][pos] == sec[pos] for rp in raw_passes):
+                q_clean_match += 1
+    if q_clean_checked < 8:
+        return True, q_clean_match, q_clean_checked
+    max_miss = max(6, int(0.10 * q_clean_checked))
+    return (q_clean_match >= q_clean_checked - max_miss), q_clean_match, q_clean_checked
+
+
+def is_frame_slip(
+    expected_lba: int, raw_2352: bytes | bytearray, max_delta: int = 16
+) -> bool:
+    """Detect physical drive frame slips where raw_2352 carries a valid neighboring LBA sector."""
+    if len(raw_2352) < 2352:
+        return False
+    msf_lba = msf_bytes_to_lba(raw_2352[12:16])
+    if msf_lba is None or msf_lba == expected_lba or abs(msf_lba - expected_lba) > max_delta:
+        return False
+    if edc_residual(raw_2352[:2068]) == 0:
+        return True
+    p_valid = sum(1 for cw in P_IDX if syndromes_p(raw_2352, cw) == (0, 0))
+    return p_valid >= 40
+
+
+def build_pass_cache(lba: int, raw_passes: list[tuple[bytes, bytes]]) -> list[dict]:
+    """Precompute cleaned headers, C2 sets, P/Q validity, and agreed 1-errors once per LBA."""
+    cache: list[dict] = []
+    for raw_sec, c2_bytes in raw_passes:
+        sec = bytearray(raw_sec)
+        init_sector_header(lba, sec)
+        c2 = c2_set(c2_bytes)
+        p_ok_raw = [syndromes_p(sec, cw) == (0, 0) for cw in P_IDX]
+        q_ok_raw = [syndromes_q(sec, cw) == (0, 0) for cw in Q_IDX]
+        p_c2_hits = [sum(1 for pos in cw if pos in c2) for cw in P_IDX]
+        q_c2_hits = [sum(1 for pos in cw if pos in c2) for cw in Q_IDX]
+
+        p_1err: dict[int, int] = {}
+        for idx, cw in enumerate(P_IDX):
+            if not p_ok_raw[idx]:
+                st1, c1 = solve_1err(sec, cw)
+                if st1 == 1 and c1[0][0] not in FIXED_POS:
+                    p_1err[c1[0][0]] = c1[0][1]
+
+        agreed_1err: dict[int, int] = {}
+        for idx, cw in enumerate(Q_IDX):
+            if not q_ok_raw[idx]:
+                st1, c1 = solve_1err(sec, cw)
+                if st1 == 1 and p_1err.get(c1[0][0]) == c1[0][1]:
+                    agreed_1err[c1[0][0]] = c1[0][1]
+
+        cache.append(
+            {
+                "sec": sec,
+                "c2": c2,
+                "p_ok_raw": p_ok_raw,
+                "q_ok_raw": q_ok_raw,
+                "p_c2_hits": p_c2_hits,
+                "q_c2_hits": q_c2_hits,
+                "p_ok_count": sum(1 for x in p_ok_raw if x),
+                "agreed_1err": agreed_1err,
+            }
+        )
+    return cache
 
 
 def compute_verified_byte_mask_2048(sec: bytes | bytearray) -> set[int]:

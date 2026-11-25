@@ -377,40 +377,70 @@ def encode_mcus(mcus: list[list[list[int]]], blk_spec: list[dict], n_comps: int)
             c_i = spec["comp_idx"]
             dc_e = spec["dc_enc"]
             ac_e = spec["ac_enc"]
-            diff = coeffs[0] - pred[c_i]
-            pred[c_i] = coeffs[0]
+            prev_dc = pred[c_i]
+            diff = coeffs[0] - prev_dc
+            ssss = abs(diff).bit_length() if diff != 0 else 0
+            if ssss not in dc_e:
+                avail_dc = [s for s in dc_e if s <= ssss]
+                s_use = max(avail_dc) if avail_dc else min(dc_e)
+                if s_use == 0:
+                    diff = 0
+                    ssss = 0
+                else:
+                    lim = (1 << s_use) - 1
+                    diff = max(-lim, min(lim, diff))
+                    ssss = s_use
+            pred[c_i] = prev_dc + diff
             if diff == 0:
                 c, ln = dc_e[0]
                 put(c, ln)
             else:
-                ssss = abs(diff).bit_length()
                 c, ln = dc_e[ssss]
                 put(c, ln)
                 bits = diff if diff > 0 else diff + (1 << ssss) - 1
                 put(bits, ssss)
 
-            last_nz = 0
-            for k in range(63, 0, -1):
-                if coeffs[k] != 0:
-                    last_nz = k
-                    break
+            # Deferred pending_zrl keeps intact MCUs 100% bit-exact while guarding sparse custom DHTs
             zeros = 0
-            for k in range(1, last_nz + 1):
+            pending_zrl = 0
+            encoded_through = 0
+            for k in range(1, 64):
                 v = coeffs[k]
+                if v != 0:
+                    ss = abs(v).bit_length()
+                    sym = (zeros << 4) | ss
+                    if sym not in ac_e:
+                        found = False
+                        for s2 in range(ss - 1, 0, -1):
+                            cand_sym = (zeros << 4) | s2
+                            if cand_sym in ac_e:
+                                lim = (1 << s2) - 1
+                                v = lim if v > 0 else -lim
+                                ss = s2
+                                sym = cand_sym
+                                found = True
+                                break
+                        if not found:
+                            v = 0
                 if v == 0:
                     zeros += 1
                     if zeros == 16:
-                        c, ln = ac_e[0xF0]
-                        put(c, ln)
+                        pending_zrl += 1
                         zeros = 0
                 else:
-                    ss = abs(v).bit_length()
+                    if pending_zrl > 0 and 0xF0 not in ac_e:
+                        break
+                    while pending_zrl > 0:
+                        c, ln = ac_e[0xF0]
+                        put(c, ln)
+                        pending_zrl -= 1
                     c, ln = ac_e[(zeros << 4) | ss]
                     put(c, ln)
                     bits = v if v > 0 else v + (1 << ss) - 1
                     put(bits, ss)
                     zeros = 0
-            if last_nz < 63:
+                    encoded_through = k
+            if encoded_through < 63 and 0x00 in ac_e:
                 c, ln = ac_e[0x00]
                 put(c, ln)
     if nbits > 0:
@@ -444,6 +474,197 @@ def extract_exif_thumbnail(data: bytes) -> bytes | None:
                     return seg[s_i : e_i + 2]
         idx += 2 + ln
     return None
+
+
+def validate_jpeg_t81_structure(data: bytes) -> tuple[bool, list[str], dict]:
+    """Strictly verify ISO/IEC 10918-1 (ITU-T T.81) marker framing, Kraft DHTs, ECS stuffing, and EOI."""
+    issues: list[str] = []
+    n = len(data)
+    if n < 4 or data[0:2] != b"\xff\xd8":
+        return False, ["missing_SOI"], {"t81_valid": False}
+
+    pos = 2
+    dqt_ids: set[int] = set()
+    dht_dc: set[int] = set()
+    dht_ac: set[int] = set()
+    sof_info: tuple[int, int, int, int, list[tuple[int, int, int, int]]] | None = None
+    dri = 0
+    scans = 0
+    eoi_pos: int | None = None
+    trailing_zero_bytes = 0
+
+    while pos < n:
+        if data[pos] != 0xFF:
+            issues.append(f"non_marker_byte_at_{pos}")
+            break
+        while pos < n and data[pos] == 0xFF:
+            pos += 1
+        if pos >= n:
+            issues.append("truncated_marker")
+            break
+        m = data[pos]
+        pos += 1
+        if m == 0xD9:
+            eoi_pos = pos
+            break
+        if m == 0x01 or (0xD0 <= m <= 0xD7):
+            continue
+        if pos + 2 > n:
+            issues.append(f"truncated_seg_len_{m:02X}")
+            break
+        seg_len = int.from_bytes(data[pos : pos + 2], "big")
+        if seg_len < 2 or pos + seg_len > n:
+            issues.append(f"bad_seg_len_{m:02X}:{seg_len}")
+            break
+        payload = data[pos + 2 : pos + seg_len]
+        pos += seg_len
+
+        if m == 0xDB:
+            p = 0
+            while p < len(payload):
+                pq_tq = payload[p]
+                p += 1
+                pq, tq = pq_tq >> 4, pq_tq & 0x0F
+                if pq not in (0, 1) or tq > 3:
+                    issues.append(f"bad_dqt_hdr:{pq},{tq}")
+                    break
+                step = 64 * (pq + 1)
+                if p + step > len(payload):
+                    issues.append("truncated_dqt")
+                    break
+                dqt_ids.add(tq)
+                p += step
+            if p != len(payload):
+                issues.append("dqt_trailing_bytes")
+        elif m == 0xC4:
+            p = 0
+            while p < len(payload):
+                tc_th = payload[p]
+                p += 1
+                tc, th = tc_th >> 4, tc_th & 0x0F
+                if tc not in (0, 1) or th > 3:
+                    issues.append(f"bad_dht_hdr:{tc},{th}")
+                    break
+                if p + 16 > len(payload):
+                    issues.append("truncated_dht_counts")
+                    break
+                counts = list(payload[p : p + 16])
+                p += 16
+                total = sum(counts)
+                if p + total > len(payload):
+                    issues.append("truncated_dht_syms")
+                    break
+                syms = list(payload[p : p + total])
+                p += total
+                kraft_num = sum(c * (1 << (16 - L)) for L, c in enumerate(counts, 1))
+                if kraft_num >= (1 << 16):
+                    issues.append(f"dht_kraft_violation_tc{tc}_th{th}")
+                if len(set(syms)) != len(syms):
+                    issues.append(f"dht_dup_sym_tc{tc}_th{th}")
+                if tc == 0:
+                    dht_dc.add(th)
+                else:
+                    dht_ac.add(th)
+            if p != len(payload):
+                issues.append("dht_trailing_bytes")
+        elif m == 0xDD:
+            if len(payload) != 2:
+                issues.append("bad_dri_len")
+            else:
+                dri = int.from_bytes(payload, "big")
+        elif m in (0xC0, 0xC1, 0xC2):
+            if len(payload) < 6:
+                issues.append("truncated_sof")
+                break
+            prec, H, W, ncomp = struct.unpack(">BHHB", payload[:6])
+            if prec not in (8, 12) or W <= 0 or H <= 0 or ncomp not in (1, 3, 4):
+                issues.append(f"bad_sof_params:{prec},{W}x{H},{ncomp}")
+            if len(payload) != 6 + 3 * ncomp:
+                issues.append("bad_sof_len")
+                break
+            comps = [
+                (payload[6 + 3 * i], payload[7 + 3 * i] >> 4, payload[7 + 3 * i] & 0x0F, payload[8 + 3 * i])
+                for i in range(ncomp)
+            ]
+            for cid, ch, cv, qt in comps:
+                if not (1 <= ch <= 4 and 1 <= cv <= 4 and qt <= 3):
+                    issues.append(f"bad_comp_spec:{cid},{ch},{cv},{qt}")
+            sof_info = (m, prec, W, H, comps)
+        elif m == 0xDA:
+            if len(payload) < 1:
+                issues.append("truncated_sos")
+                break
+            ns = payload[0]
+            if ns < 1 or len(payload) != 1 + 2 * ns + 3:
+                issues.append("bad_sos_len")
+                break
+            scomps = [
+                (payload[1 + 2 * i], payload[2 + 2 * i] >> 4, payload[2 + 2 * i] & 0x0F)
+                for i in range(ns)
+            ]
+            ss, se, ahal = payload[-3], payload[-2], payload[-1]
+            if sof_info is not None:
+                comp_ids = {c[0] for c in sof_info[4]}
+                for cs, td, ta in scomps:
+                    if cs not in comp_ids:
+                        issues.append(f"undefined_sos_comp:{cs}")
+                    if sof_info[0] in (0xC0, 0xC1):
+                        if td not in dht_dc or ta not in dht_ac:
+                            issues.append(f"undefined_sos_dht:{td},{ta}")
+                if sof_info[0] in (0xC0, 0xC1) and (ss, se, ahal) != (0, 63, 0):
+                    issues.append(f"non_baseline_spectral:{ss},{se},{ahal}")
+            scans += 1
+            cur = pos
+            is_prog = sof_info is not None and sof_info[0] == 0xC2
+            while cur < n:
+                idx_ff = data.find(b"\xff", cur)
+                if idx_ff == -1 or idx_ff + 1 >= n:
+                    issues.append("missing_EOI_in_scan")
+                    pos = n
+                    break
+                nxt = data[idx_ff + 1]
+                if nxt == 0x00:
+                    cur = idx_ff + 2
+                elif nxt == 0xFF:
+                    cur = idx_ff + 1
+                elif 0xD0 <= nxt <= 0xD7:
+                    if dri == 0:
+                        issues.append(f"unexpected_RST_{nxt:02X}_with_dri0")
+                    cur = idx_ff + 2
+                elif nxt == 0xD9 or (is_prog and nxt in (0xDA, 0xC4, 0xDB, 0xDD, 0xFE)):
+                    pos = idx_ff
+                    break
+                else:
+                    issues.append(f"illegal_marker_in_scan:0xFF{nxt:02X}")
+                    pos = idx_ff
+                    break
+
+    if eoi_pos is None:
+        issues.append("missing_EOI")
+    elif eoi_pos < n:
+        trailing = data[eoi_pos:]
+        if all(b == 0 for b in trailing):
+            trailing_zero_bytes = len(trailing)
+        else:
+            issues.append(f"trailing_nonzero_after_EOI:{len(trailing)}")
+
+    if sof_info is None or scans == 0:
+        issues.append("missing_SOF_or_SOS")
+    else:
+        for _, _, _, qt in sof_info[4]:
+            if qt not in dqt_ids:
+                issues.append(f"undefined_DQT:{qt}")
+
+    meta = {
+        "t81_valid": len(issues) == 0,
+        "sof_marker": f"0x{sof_info[0]:02X}" if sof_info else None,
+        "width": sof_info[2] if sof_info else 0,
+        "height": sof_info[3] if sof_info else 0,
+        "dri": dri,
+        "scans": scans,
+        "trailing_zero_bytes": trailing_zero_bytes,
+    }
+    return len(issues) == 0, issues, meta
 
 
 @FormatRegistry.register
@@ -503,23 +724,26 @@ class JpegFormatHandler(FileFormatHandler):
         return None, None
 
     def validate(self, data: bytes) -> tuple[bool, str, dict]:
+        t81_ok, t81_issues, t81_meta = validate_jpeg_t81_structure(data)
+        if not t81_ok:
+            return False, f"T81_STRUCT_ERR ({'; '.join(t81_issues[:3])})", t81_meta
         ImageFile.LOAD_TRUNCATED_IMAGES = False
         try:
             with Image.open(io.BytesIO(data)) as im:
                 im.verify()
             with Image.open(io.BytesIO(data)) as im2:
                 im2.load()
-                meta = {"dims": f"{im2.size[0]}x{im2.size[1]} {im2.mode}"}
+                meta = {"dims": f"{im2.size[0]}x{im2.size[1]} {im2.mode}", **t81_meta}
             return True, "STRICT_OK", meta
         except Exception as exc_strict:
             ImageFile.LOAD_TRUNCATED_IMAGES = True
             try:
                 with Image.open(io.BytesIO(data)) as im3:
                     im3.load()
-                    meta = {"dims": f"{im3.size[0]}x{im3.size[1]} {im3.mode}"}
+                    meta = {"dims": f"{im3.size[0]}x{im3.size[1]} {im3.mode}", **t81_meta}
                 return False, f"TRUNCATED_OK ({type(exc_strict).__name__})", meta
             except Exception as exc_trunc:
-                return False, f"DECODE_ERR ({type(exc_trunc).__name__}: {exc_trunc})", {}
+                return False, f"DECODE_ERR ({type(exc_trunc).__name__}: {exc_trunc})", t81_meta
             finally:
                 ImageFile.LOAD_TRUNCATED_IMAGES = False
 

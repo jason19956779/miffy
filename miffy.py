@@ -53,7 +53,10 @@ def main() -> int:
         help="Comma-separated directory/extension/alias filter or 'all'",
     )
     parser.add_argument("--max-passes", type=int, default=48, help="Maximum multi-tier optical pass rounds")
+    parser.add_argument("--focus-passes", type=int, default=24, help="Focused directional burst rounds when <=24 media LBAs remain")
     parser.add_argument("--max-tier", type=int, default=3, help="Maximum algebraic solver tier (1..3)")
+    parser.add_argument("--workers", type=int, default=0, help="Parallel worker processes for Tier 3 solving (0=auto, 1=serial)")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose timestamped debug logs, JSONL events, and SQLite telemetry")
     parser.add_argument("--report-out", type=Path, default=None, help="Override summary JSON report path")
     parser.add_argument("--list-plugins", action="store_true", help="List all registered solver and format plugins and exit")
     parser.add_argument("--test-synthetic-repair", action="store_true", help="Run in-memory synthetic JPEG & BMP repair test and exit")
@@ -82,7 +85,10 @@ def main() -> int:
         extract_dir=args.extract_dir,
         categories=categories,
         max_passes=args.max_passes,
+        focus_passes=args.focus_passes,
         max_tier=args.max_tier,
+        workers=args.workers,
+        debug=args.debug,
         report_out=args.report_out,
     )
     print(json.dumps(report, indent=2))
