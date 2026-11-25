@@ -7,6 +7,8 @@ from typing import Callable
 from src.core.models import EtiologyReport, FileExtent
 
 PHOTO_MAIN_EXTS = {".JPG", ".JPEG", ".BMP", ".PNG", ".TIF", ".TIFF", ".GIF", ".WEBP"}
+AUDIO_EXTS = {".MP3", ".MP2", ".WAV", ".FLAC", ".OGG", ".AAC", ".M4A", ".WMA", ".OPUS", ".AIFF"}
+VIDEO_EXTS = {".MPG", ".MPEG", ".MP4", ".AVI", ".MOV", ".MKV", ".WMV", ".VOB", ".M2V", ".M1V", ".ASF"}
 
 
 def parse_pvd(read_sector: Callable[[int], bytes]) -> dict:
@@ -126,6 +128,8 @@ def parse_iso9660_tree(
                 overlap = [lba for lba in range(ext_lba, ext_lba + n_sec) if lba in bad_set]
                 d_up = cur_dir.upper()
                 if ext in PHOTO_MAIN_EXTS and not d_up.endswith("/S") and "/S/" not in d_up:
+                    prio = 10
+                elif ext in AUDIO_EXTS or ext in VIDEO_EXTS or (ext == ".DAT" and d_up in ("/MPEGAV", "/SEGMENT")):
                     prio = 10
                 elif ext in PHOTO_MAIN_EXTS:
                     prio = 20

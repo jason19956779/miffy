@@ -181,9 +181,18 @@ class RecoveryStateDB:
         return sorted(lbas)
 
     def insert_raw_pass(
-        self, lba: int, pass_id: int, raw_2352: bytes, c2_294: bytes
+        self,
+        lba: int,
+        pass_id: int,
+        raw_2352: bytes,
+        c2_294: bytes,
+        p_ok: int | None = None,
+        q_ok: int | None = None,
     ) -> tuple[int, int]:
-        pz, qz = rspc.count_pq(raw_2352)
+        if p_ok is None or q_ok is None:
+            pz, qz = rspc.count_pq(raw_2352)
+        else:
+            pz, qz = int(p_ok), int(q_ok)
         self.conn.execute(
             "INSERT OR REPLACE INTO raw_passes "
             "(lba, pass_id, raw_2352, c2_294, p_ok, q_ok) VALUES (?, ?, ?, ?, ?, ?)",
@@ -399,3 +408,28 @@ def prepare_output_iso(
         if cur_bytes < target_bytes:
             with iso_out.open("r+b") as f:
                 f.truncate(target_bytes)
+
+
+def preserve_baseline_image(
+    src_path: Path,
+    baseline_path: Path,
+    cue_src: Path | None = None,
+    cue_baseline: Path | None = None,
+) -> bool:
+    """Create a read-only (0444) Pass-0 baseline copy without overwriting any existing baseline."""
+    if not src_path.exists() or baseline_path.exists():
+        return False
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, baseline_path)
+    baseline_path.chmod(0o444)
+    if (
+        cue_src is not None
+        and cue_baseline is not None
+        and cue_src.exists()
+        and not cue_baseline.exists()
+    ):
+        cue_text = cue_src.read_text(encoding="utf-8")
+        cue_text = cue_text.replace(f'"{src_path.name}"', f'"{baseline_path.name}"')
+        cue_baseline.write_text(cue_text, encoding="utf-8")
+        cue_baseline.chmod(0o444)
+    return True

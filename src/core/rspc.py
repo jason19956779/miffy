@@ -353,3 +353,167 @@ def weighted_modal_vote(lba: int, raw_passes: list[tuple[bytes, bytes]]) -> byte
         if j not in FIXED_POS:
             sec[j] = votes[j].most_common(1)[0][0]
     return sec
+
+
+ZERO_294 = b"\x00" * 294
+
+
+def lba_header_mode(lba: int, mode: int = 0x01) -> bytes:
+    """Build canonical 4-byte MSF+Mode header for an LBA and CD sector mode (1 or 2)."""
+    frames = lba + 150
+    return bytes(
+        [
+            to_bcd(frames // 4500),
+            to_bcd((frames % 4500) // 75),
+            to_bcd(frames % 75),
+            mode & 0xFF,
+        ]
+    )
+
+
+def msf_bytes_to_lba_any(
+    hdr4: bytes | bytearray, expected_mode: int | None = None
+) -> tuple[int, int] | None:
+    """Decode a 4-byte MSF+Mode header into `(lba, mode)`, or None if invalid BCD/mode."""
+    if len(hdr4) < 4:
+        return None
+    mode = hdr4[3]
+    if expected_mode is not None:
+        if mode != expected_mode:
+            return None
+    elif mode not in (1, 2):
+        return None
+    vals = []
+    for b in hdr4[:3]:
+        hi, lo = (b >> 4) & 0x0F, b & 0x0F
+        if hi > 9 or lo > 9:
+            return None
+        vals.append(hi * 10 + lo)
+    mm, ss, ff = vals
+    if ss >= 60 or ff >= 75:
+        return None
+    frames = (mm * 60 + ss) * 75 + ff
+    return (frames - 150, mode) if frames >= 150 else None
+
+
+def is_mode2_form2(raw_2352: bytes | bytearray) -> bool:
+    """Return True if a raw 2352-byte sector is CD-ROM XA Mode 2 Form 2."""
+    return len(raw_2352) >= 24 and raw_2352[15] == 0x02 and bool(raw_2352[18] & 0x20)
+
+
+def count_pq_mode2_f1(raw_2352: bytes | bytearray) -> tuple[int, int]:
+    """Count zero-syndrome P/Q codewords for Mode 2 Form 1 (bytes 12..15 zeroed)."""
+    sec = bytearray(raw_2352[:2352])
+    sec[12:16] = b"\x00\x00\x00\x00"
+    return count_pq(sec)
+
+
+def verify_mode2_sector(
+    expected_lba: int,
+    raw_2352: bytes | bytearray,
+    c2_294: bytes | None = None,
+) -> tuple[bool, str, int, int]:
+    """Verify Sync, Mode-2 MSF header, XA subheader mirror, EDC, and Form-1 P/Q or Form-2 C2."""
+    if (
+        len(raw_2352) < 2352
+        or raw_2352[0:12] != SYNC_12
+        or raw_2352[12:16] != lba_header_mode(expected_lba, 0x02)
+    ):
+        return False, "M2_HDR_ERR", 0, 0
+
+    sub_ok = raw_2352[16:20] == raw_2352[20:24]
+    if raw_2352[18] & 0x20:
+        c2_clean = (c2_294 is None) or (c2_294 == ZERO_294)
+        stored_edc = int.from_bytes(raw_2352[2348:2352], "little")
+        calc_edc = compute_edc(raw_2352[16:2348])
+        if stored_edc != 0:
+            if sub_ok and calc_edc == stored_edc and c2_clean:
+                return True, "M2F2_EDC_OK", 0, 0
+            return False, "M2F2_ERR", 0, 0
+        if sub_ok and c2_clean:
+            return True, "M2F2_ZERO_EDC_C2_OK", 0, 0
+        return False, "M2F2_ERR", 0, 0
+
+    pz, qz = count_pq_mode2_f1(raw_2352)
+    calc_edc = compute_edc(raw_2352[16:2072])
+    stored_edc = int.from_bytes(raw_2352[2072:2076], "little")
+    if sub_ok and calc_edc == stored_edc and pz == 86 and qz == 52:
+        return True, "M2F1_OK", 86, 52
+    return False, "M2F1_ERR", pz, qz
+
+
+def is_frame_slip_mode2(
+    expected_lba: int, raw_2352: bytes | bytearray, max_delta: int = 16
+) -> bool:
+    """Detect physical drive frame slips where raw_2352 carries a valid neighboring Mode 2 LBA."""
+    if len(raw_2352) < 2352:
+        return False
+    decoded = msf_bytes_to_lba_any(raw_2352[12:16], expected_mode=2)
+    if decoded is None:
+        return False
+    msf_lba, _ = decoded
+    if msf_lba == expected_lba or abs(msf_lba - expected_lba) > max_delta:
+        return False
+    sub_ok = raw_2352[16:20] == raw_2352[20:24]
+    if raw_2352[18] & 0x20:
+        stored_edc = int.from_bytes(raw_2352[2348:2352], "little")
+        return sub_ok and (stored_edc == 0 or compute_edc(raw_2352[16:2348]) == stored_edc)
+    if sub_ok and compute_edc(raw_2352[16:2072]) == int.from_bytes(raw_2352[2072:2076], "little"):
+        return True
+    pz, _ = count_pq_mode2_f1(raw_2352)
+    return pz >= 40
+
+
+def clean_single_pass_mode2_f1(
+    lba: int, raw_2352: bytes, c2_294: bytes
+) -> tuple[bool, bytearray]:
+    """Single-pass P/Q + C2 erasure solver for Mode 2 Form 1 (with bytes 12..15 zeroed)."""
+    if len(raw_2352) < 2352 or len(c2_294) < 294:
+        return False, bytearray(raw_2352)
+    sec = bytearray(raw_2352[:2352])
+    sec[0:12] = SYNC_12
+    sec[12:16] = b"\x00\x00\x00\x00"
+    c2 = {j for j in range(16, 2352) if (c2_294[j >> 3] >> (7 - (j & 7))) & 1}
+
+    for _ in range(8):
+        changed = False
+        for cw in P_IDX:
+            if syndromes_p(sec, cw) != (0, 0):
+                eras = [idx for idx, pos in enumerate(cw) if pos in c2]
+                if 1 <= len(eras) <= 2:
+                    ok_e, corrs = solve_2eras(sec, cw, eras)
+                    if ok_e:
+                        for pos, val in corrs:
+                            sec[pos] = val
+                        for idx in eras:
+                            c2.discard(cw[idx])
+                        changed = True
+                elif not eras:
+                    st1, c1 = solve_1err(sec, cw)
+                    if st1 == 1 and c1[0][0] >= 16:
+                        sec[c1[0][0]] = c1[0][1]
+                        c2.discard(c1[0][0])
+                        changed = True
+        for cw in Q_IDX:
+            if syndromes_q(sec, cw) != (0, 0):
+                eras = [idx for idx, pos in enumerate(cw) if pos in c2]
+                if 1 <= len(eras) <= 2:
+                    ok_e, corrs = solve_2eras(sec, cw, eras)
+                    if ok_e:
+                        for pos, val in corrs:
+                            sec[pos] = val
+                        for idx in eras:
+                            c2.discard(cw[idx])
+                        changed = True
+                elif not eras:
+                    st1, c1 = solve_1err(sec, cw)
+                    if st1 == 1 and c1[0][0] >= 16:
+                        sec[c1[0][0]] = c1[0][1]
+                        c2.discard(c1[0][0])
+                        changed = True
+        if not changed:
+            break
+
+    sec[12:16] = lba_header_mode(lba, mode=0x02)
+    ok, _, _, _ = verify_mode2_sector(lba, sec)
+    return ok, sec

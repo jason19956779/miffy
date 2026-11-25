@@ -3,6 +3,7 @@
 import ctypes
 import fcntl
 import os
+import struct
 from pathlib import Path
 
 from src.core.models import DeviceCapabilities
@@ -227,6 +228,131 @@ class OpticalDrive:
             return int.from_bytes(cap[0:4], "big") + 1
         raise RuntimeError("Unable to determine CD volume sector count")
 
+    def read_toc(self) -> list[dict]:
+        """Issue SCSI READ TOC (0x43) Format 0 (LBA mode) and return track descriptors."""
+        st, _, _, toc = self.scsi_cmd(
+            [0x43, 0x00, 0x00, 0, 0, 0, 0, 0x03, 0x24, 0], buf_len=804, direction=-3
+        )
+        tracks: list[dict] = []
+        if st != 0 or len(toc) < 4:
+            return tracks
+        toc_len = struct.unpack(">H", toc[0:2])[0]
+        off = 4
+        end = min(len(toc), toc_len + 2)
+        while off + 8 <= end:
+            adr_ctrl = toc[off + 1]
+            trk_no = toc[off + 2]
+            lba = struct.unpack(">i", toc[off + 4 : off + 8])[0]
+            ctrl = adr_ctrl & 0x0F
+            tracks.append(
+                {
+                    "track": trk_no,
+                    "control": ctrl,
+                    "is_data": bool(ctrl & 0x04),
+                    "start_lba": lba,
+                }
+            )
+            off += 8
+        return tracks
+
+    def read_toc_sessions(self) -> dict:
+        """Issue SCSI READ TOC Format 1 (Session Info)."""
+        st, _, _, sess = self.scsi_cmd(
+            [0x43, 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x10, 0], buf_len=16, direction=-3
+        )
+        if st != 0 or len(sess) < 12:
+            return {"ok": False}
+        return {
+            "ok": True,
+            "first_session": sess[2],
+            "last_session": sess[3],
+            "last_session_first_track": sess[6],
+            "last_session_start_lba": struct.unpack(">i", sess[8:12])[0],
+        }
+
+    def read_cd_text(self) -> dict:
+        """Issue SCSI READ TOC Format 5 (CD-TEXT)."""
+        st, _, _, cdtext = self.scsi_cmd(
+            [0x43, 0x00, 0x05, 0, 0, 0, 0, 0x08, 0x00, 0], buf_len=2048, direction=-3
+        )
+        if st != 0 or len(cdtext) < 4:
+            return {"present": False, "length": 0}
+        clen = struct.unpack(">H", cdtext[0:2])[0]
+        return {"present": clen > 2, "length": clen}
+
+    def read_mcn(self) -> dict:
+        """Issue SCSI READ SUB-CHANNEL (0x42) format 0x02 for Media Catalog Number."""
+        st, _, _, mcn = self.scsi_cmd(
+            [0x42, 0x00, 0x40, 0x02, 0, 0, 0, 0, 24, 0], buf_len=24, direction=-3
+        )
+        if st != 0 or len(mcn) < 22:
+            return {"valid": False, "mcn": ""}
+        valid = bool(mcn[8] & 0x80)
+        val = mcn[9:22].decode("ascii", errors="replace").strip("\x00 ") if valid else ""
+        return {"valid": valid, "mcn": val}
+
+    @classmethod
+    def read_drive_status(cls, device_path: str | None = None) -> dict:
+        """Read-only SCSI INQUIRY + MODE SENSE (10) check of Mode Pages 0x01 and 0x2A."""
+        drive = cls(device_path)
+        drive.fd = os.open(drive.sg_device, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            st_inq, _, _, inq = drive.scsi_cmd([0x12, 0, 0, 0, 36, 0], buf_len=36, direction=-3)
+            vendor = (
+                inq[8:32].decode("ascii", errors="replace").strip()
+                if st_inq == 0 and len(inq) >= 32
+                else "Unknown Optical Drive"
+            )
+            st_01, sense_01, _, p01 = drive.scsi_cmd(
+                [0x5A, 0, 0x01, 0, 0, 0, 0, 0, 64, 0], buf_len=64, direction=-3
+            )
+            st_2a, sense_2a, _, p2a = drive.scsi_cmd(
+                [0x5A, 0, 0x2A, 0, 0, 0, 0, 0, 64, 0], buf_len=64, direction=-3
+            )
+            err_bits = p01[10] if st_01 == 0 and len(p01) >= 12 else -1
+            retries = p01[11] if st_01 == 0 and len(p01) >= 12 else -1
+            b5 = p2a[13] if st_2a == 0 and len(p2a) >= 24 else 0
+            max_spd = int.from_bytes(p2a[16:18], "big") if st_2a == 0 and len(p2a) >= 18 else 0
+            cur_spd = int.from_bytes(p2a[22:24], "big") if st_2a == 0 and len(p2a) >= 24 else 0
+            return {
+                "sg_device": drive.sg_device,
+                "sr_device": drive.sr_device,
+                "vendor_model": vendor,
+                "mode_page_01": {
+                    "status": st_01,
+                    "sense": list(sense_01),
+                    "err_bits": err_bits,
+                    "retries": retries,
+                    "err_bits_hex": f"0x{err_bits:02X}" if err_bits >= 0 else "ERR",
+                    "retries_hex": f"0x{retries:02X}" if retries >= 0 else "ERR",
+                    "restored_ok": bool(st_01 == 0 and err_bits == 0x00 and retries == 0x80),
+                },
+                "mode_page_2a": {
+                    "status": st_2a,
+                    "sense": list(sense_2a),
+                    "cdda": bool(b5 & 0x01),
+                    "accurate_stream": bool(b5 & 0x02),
+                    "c2": bool(b5 & 0x10),
+                    "max_speed_kbps": max_spd,
+                    "cur_speed_kbps": cur_spd,
+                },
+            }
+        finally:
+            if drive.fd is not None:
+                os.close(drive.fd)
+                drive.fd = None
+
+    def detect_disc_mode(self) -> tuple[str, list[dict], int]:
+        """Detect Mode 1 vs CD-ROM XA Mode 2 disc, returning `(mode, tracks, total_sectors)`."""
+        tracks = self.read_toc()
+        st, _, resid, raw16 = self.read_cd_raw(16, 1, with_c2=False)
+        if st == 0 and resid == 0 and len(raw16) >= 30:
+            if raw16[15] == 0x02 or raw16[25:30] == b"CD001":
+                leadout = next((t["start_lba"] for t in tracks if t["track"] == 170), None)
+                total = leadout if (leadout is not None and leadout > 0) else self.read_total_volume_sectors()
+                return "mode2", tracks, total
+        return "mode1", tracks, self.read_total_volume_sectors()
+
     def directional_seek_flush(
         self, target_lba: int, direction: str, total_sectors: int, offset_seed: int = 0
     ) -> None:
@@ -237,3 +363,6 @@ class OpticalDrive:
         else:
             seek_lba = max(0, target_lba - 800 - jitter)
         self.read_cd_raw(seek_lba, 1, with_c2=False)
+
+
+read_drive_status = OpticalDrive.read_drive_status

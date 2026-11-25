@@ -1,6 +1,7 @@
 """Abstract plugin interface for format-specific validation, reference matching, and repair."""
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Callable
 
 from src.core.models import FileExtent
@@ -30,6 +31,10 @@ class FileFormatHandler(ABC):
     @abstractmethod
     def validate(self, data: bytes) -> tuple[bool, str, dict]:
         """Validate recovered file bytes and return `(is_valid, status_label, metadata)`."""
+
+    def validate_file(self, path: Path) -> tuple[bool, str, dict]:
+        """Validate recovered file on disk (streaming override optional for large files)."""
+        return self.validate(path.read_bytes())
 
     def reconstruct(
         self,

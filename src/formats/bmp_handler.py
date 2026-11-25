@@ -63,7 +63,7 @@ class BmpFormatHandler(FileFormatHandler):
     def can_handle(self, ext: str, data: bytes | None = None) -> bool:
         if ext.upper() in self.extensions:
             return True
-        return bool(data and data[:2] == b"BM")
+        return bool(not ext and data and len(data) >= 54 and data[:2] == b"BM")
 
     def find_reference(
         self,

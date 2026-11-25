@@ -33,6 +33,7 @@ class FormatRegistry:
 from src.formats import jpeg_handler as _jpeg  # noqa: E402, F401
 from src.formats import bmp_handler as _bmp  # noqa: E402, F401
 from src.formats import image_generic as _img  # noqa: E402, F401
+from src.formats import media_handlers as _media  # noqa: E402, F401
 from src.formats import binary_handlers as _bin  # noqa: E402, F401
 
 __all__ = ["FormatRegistry", "FileFormatHandler"]

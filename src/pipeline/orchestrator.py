@@ -15,7 +15,12 @@ from PIL import Image, ImageFile
 from src.core import rspc
 from src.core.logging_utils import RecoveryLogger, format_timestamp
 from src.core.models import FileExtent, FileRecoveryResult
-from src.core.state import RecoveryStateDB, load_wincdemu_bad_lbas, prepare_output_iso
+from src.core.state import (
+    RecoveryStateDB,
+    load_wincdemu_bad_lbas,
+    prepare_output_iso,
+    preserve_baseline_image,
+)
 from src.filesystem import iso9660
 from src.formats import FormatRegistry
 from src.hardware.device import OpticalDrive
@@ -63,6 +68,10 @@ def resolve_session_dir(
                 pvd_sec = drive.read_cooked_sector(16)
                 if pvd_sec and len(pvd_sec) >= 72 and pvd_sec[1:6] == b"CD001":
                     resolved = sanitize_volume_id(pvd_sec[40:72].decode("ascii", errors="ignore"))
+                if not resolved:
+                    st_m2, _, res_m2, raw_m2 = drive.read_cd_raw(16, 1, with_c2=False)
+                    if st_m2 == 0 and res_m2 == 0 and len(raw_m2) >= 96 and raw_m2[25:30] == b"CD001":
+                        resolved = sanitize_volume_id(raw_m2[64:96].decode("ascii", errors="ignore"))
         except Exception:
             pass
 
@@ -85,6 +94,14 @@ def _match_category(ext_obj: FileExtent, categories: list[str]) -> bool:
         "xtras": lambda e: d_up == "/XTRAS",
         "root": lambda e: d_up == "/",
         "images": lambda e: e.ext in iso9660.PHOTO_MAIN_EXTS,
+        "audio": lambda e: e.ext in iso9660.AUDIO_EXTS,
+        "video": lambda e: e.ext in iso9660.VIDEO_EXTS or (e.ext == ".DAT" and d_up in ("/MPEGAV", "/SEGMENT")),
+        "media": lambda e: (
+            e.ext in iso9660.PHOTO_MAIN_EXTS
+            or e.ext in iso9660.AUDIO_EXTS
+            or e.ext in iso9660.VIDEO_EXTS
+            or (e.ext == ".DAT" and d_up in ("/MPEGAV", "/SEGMENT"))
+        ),
     }
     for cat in categories:
         fn = alias_map.get(cat.lower())
@@ -1441,13 +1458,14 @@ def run_automated_pipeline(
     workers: int = 0,
     debug: bool = False,
     report_out: Path | None = None,
+    save_baseline: bool = False,
 ) -> dict:
     """Execute the full 6-stage automated CD ripping, solving, repair, and validation pipeline."""
     t_pipeline0 = time.time()
     started_at = format_timestamp()
     timing: dict[str, float | str] = {"started_at": started_at}
 
-    cats = categories if categories is not None else ["photo_l", "photo_s", "pic", "photo"]
+    cats = categories if categories is not None else ["all"]
     resolved_name, session_dir = resolve_session_dir(
         recovered_root=recovered_root,
         session_name=session_name,
@@ -1460,6 +1478,7 @@ def run_automated_pipeline(
     logs_dir = session_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    user_iso_out = iso_out
     iso_out = iso_out or (session_dir / f"{resolved_name.lower()}_recovered.iso")
     db_path = db_path or (logs_dir / "raw_passes.sqlite3")
     extract_dir = extract_dir or (session_dir / "extracted")
@@ -1479,7 +1498,36 @@ def run_automated_pipeline(
                     f"[Stage 1: Hardware Probe] {caps.sg_device} ({caps.sr_device}) | "
                     f"{caps.vendor_model} | C2={caps.supports_c2} | max_batch={caps.max_batch_sectors}"
                 )
-                total_sectors = drive.read_total_volume_sectors()
+                disc_mode = "mode1"
+                tracks: list[dict] = []
+                if user_iso_out is None and seed_iso is None:
+                    disc_mode, tracks, total_sectors = drive.detect_disc_mode()
+                else:
+                    total_sectors = drive.read_total_volume_sectors()
+                if disc_mode == "mode2":
+                    from src.pipeline.vcd_mode2 import run_mode2_pipeline
+
+                    return run_mode2_pipeline(
+                        drive=drive,
+                        tracks=tracks,
+                        total_sectors=total_sectors,
+                        recovered_root=recovered_root,
+                        session_name=resolved_name,
+                        bad_log=bad_log,
+                        full_rip=full_rip,
+                        categories=cats,
+                        max_passes=max_passes,
+                        focus_passes=focus_passes,
+                        max_tier=max_tier,
+                        workers=workers,
+                        debug=debug,
+                        report_out=report_out,
+                        existing_db=db,
+                        existing_logger=logger,
+                        t_stage1_start=t_s1,
+                        t_pipeline_start=t_pipeline0,
+                        save_baseline=save_baseline,
+                    )
                 iso_existed = iso_out.exists() and iso_out.stat().st_size > 0
                 prepare_output_iso(iso_out, seed_iso, total_sectors)
                 timing["stage1_probe_s"] = round(time.time() - t_s1, 3)
@@ -1488,8 +1536,37 @@ def run_automated_pipeline(
                     logger.info(f"[Stage 2: Pass-0 Raw+C2 Rip] Ripping {total_sectors} sectors...")
                     bad_lbas = pass0_full_rip(drive, db, iso_out, total_sectors, logger=logger)
                     timing["stage2_pass0_s"] = round(time.time() - t_s2, 3)
+                    if save_baseline and seed_iso is None:
+                        if preserve_baseline_image(iso_out, session_dir / "baseline.iso"):
+                            logger.info(f"[Baseline Preserved] {session_dir / 'baseline.iso'} (0444)")
         else:
             logger.info("[Stage 1: Offline Mode] Skipping optical device probe.")
+            bin_fallback = session_dir / f"{resolved_name.lower()}_recovered.bin"
+            if user_iso_out is None and seed_iso is None and bin_fallback.exists() and not iso_out.exists():
+                from src.pipeline.vcd_mode2 import run_mode2_pipeline
+
+                total_bin_sectors = bin_fallback.stat().st_size // 2352
+                return run_mode2_pipeline(
+                    drive=None,
+                    tracks=[],
+                    total_sectors=total_bin_sectors,
+                    recovered_root=recovered_root,
+                    session_name=resolved_name,
+                    bad_log=bad_log,
+                    full_rip=False,
+                    categories=cats,
+                    max_passes=0,
+                    focus_passes=0,
+                    max_tier=max_tier,
+                    workers=workers,
+                    debug=debug,
+                    report_out=report_out,
+                    existing_db=db,
+                    existing_logger=logger,
+                    t_stage1_start=t_pipeline0,
+                    t_pipeline_start=t_pipeline0,
+                    save_baseline=save_baseline,
+                )
             prepare_output_iso(iso_out, seed_iso, None)
             total_sectors = iso_out.stat().st_size // 2048
 
@@ -1608,7 +1685,7 @@ def run_automated_pipeline(
 
         # Write state JSON, file manifest CSV, and summary report JSON
         state_json = db.export_state_json(report_out.parent / "recovery_state.json", bad_lbas)
-        manifest_csv = extract_dir / "photo_manifest.csv"
+        manifest_csv = extract_dir / "manifest.csv"
         if results:
             rows_dict = [
                 {

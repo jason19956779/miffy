@@ -17,8 +17,10 @@ from src.core import rspc
 from src.core.logging_utils import RecoveryLogger
 from src.core.models import FileExtent
 from src.core.state import RecoveryStateDB
+from src.filesystem import iso9660
 from src.pipeline.orchestrator import (
     SPEEDS_MULTI,
+    _match_category,
     _run_tier3_phase,
     partition_targets_by_priority,
     resolve_session_dir,
@@ -135,6 +137,15 @@ class TestAutoPipeline(unittest.TestCase):
         self.assertEqual(media_lbas, [200, 201, 300, 400])
         self.assertEqual(bulk_lbas, [500, 700, 900, 901])
         self.assertTrue(set(media_lbas).isdisjoint(set(bulk_lbas)))
+
+        aud_ext = FileExtent(path="/AUDIO/01.MP3", directory="/AUDIO", name="01.MP3", ext=".MP3", start_lba=10, end_lba=12, size_bytes=3000, sectors=2, bad_lbas=[10], priority=10)
+        vid_ext = FileExtent(path="/MPEGAV/AVSEQ01.DAT", directory="/MPEGAV", name="AVSEQ01.DAT", ext=".DAT", start_lba=20, end_lba=22, size_bytes=4096, sectors=2, bad_lbas=[20], priority=10)
+        self.assertTrue(_match_category(aud_ext, ["audio"]))
+        self.assertTrue(_match_category(aud_ext, ["media"]))
+        self.assertTrue(_match_category(vid_ext, ["video"]))
+        self.assertTrue(_match_category(vid_ext, ["media"]))
+        self.assertIn(".MP3", iso9660.AUDIO_EXTS)
+        self.assertIn(".MPG", iso9660.VIDEO_EXTS)
 
     def test_cli_debug_flag_and_timestamps(self):
         help_out = subprocess.check_output(
@@ -378,6 +389,9 @@ class TestAutoPipeline(unittest.TestCase):
             json_start = out_dbg.index("{")
             report_dbg = json.loads(out_dbg[json_start:])
             self.assertTrue(report_dbg["debug_enabled"])
+            self.assertTrue(report_dbg["manifest_csv"].endswith("manifest.csv"))
+            self.assertFalse((Path(report_dbg["session_dir"]) / "extracted" / "photo_manifest.csv").exists())
+            self.assertTrue((Path(report_dbg["session_dir"]) / "extracted" / "manifest.csv").exists())
 
             # Normal mode (--debug omitted) must keep concise milestones without [DEBUG] lines
             iso_q = tmp_dir / "quiet_live.iso"
